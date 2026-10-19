@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, JSON
 from fastcore.utils import run, mkdir, Path
 from fastcore.net import urlsave
 import urllib.error
+from urllib.parse import unquote, urljoin, urlsplit
 from rjsmin import jsmin
 from bs4 import BeautifulSoup as bs
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -441,13 +442,25 @@ def fix_nb(nbpath):
     nb = nbformat.read(nbpath, as_version=4)
     nbformat.write(nb, nbpath)
 
-def fix_image_paths(html_path: str|Path):
-    """Fix image paths in HTML to handle missing images gracefully"""
+def fix_image_paths(html_path: str|Path, notebook_url: str|None = None):
+    """Resolve repository images while preserving locally generated figures."""
     doc = Path(html_path)
     soup = bs(doc.read_text(encoding='utf-8'), 'html.parser')
     
     # Add onerror handler to all images
     for img in soup.find_all('img'):
+        src = img.get('src', '')
+        try: parsed = urlsplit(src)
+        except ValueError: parsed = None
+        if (notebook_url and parsed and parsed.path and not parsed.scheme
+            and not parsed.netloc and not src.startswith(('/', '\\'))):
+            try:
+                local_image = (doc.parent / unquote(parsed.path)).resolve()
+                generated = local_image.is_relative_to(doc.parent.resolve()) and local_image.is_file()
+            except (OSError, ValueError):
+                generated = False
+            if not generated:
+                img['src'] = urljoin(notebook_url, src)
         if 'onerror' not in img.attrs:
             img['onerror'] = "this.style.display='none'"
     
@@ -459,7 +472,8 @@ async def serve_notebook(file_path, gist=False):
     d.mkdir(parents=True, exist_ok=True)
     full_url = 'https://github.com/' + file_path if not gist else 'https://gist.github.com/' + file_path
     try:
-        nm = urlsave(git2raw(full_url), d)
+        notebook_url = git2raw(full_url)
+        nm = urlsave(notebook_url, d)
         nm = nm.rename(nm.parent/escape_filename(nm.name))
         
         hash_val = hashlib.md5(open(nm,'rb').read()).hexdigest()
@@ -484,7 +498,7 @@ async def serve_notebook(file_path, gist=False):
             shutil.copytree(d, str(new_path), dirs_exist_ok=True)
             title = get_title(f'{new_path}/{fname}')
             update_meta(f'{new_path}/{fname}', f'https://nbsanity.com/static/{hash_val}/cover.png', title)
-            fix_image_paths(f'{new_path}/{fname}')
+            fix_image_paths(f'{new_path}/{fname}', notebook_url)
             run(f'shot-scraper "{new_path}/{fname}" -o {new_path}/cover.png -w 1200 -h 630')
         shutil.rmtree(d, ignore_errors=True)
         return RedirectResponse(f'/{new_path}/{fname}')
